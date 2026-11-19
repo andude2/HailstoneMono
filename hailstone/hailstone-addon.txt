@@ -1,0 +1,6 @@
+hailstone-addon 1
+name HSMono
+kind plugin
+version 0.5.0
+description Windows x64 C# Sentinel host for Hailstone.
+caps read,commands,target,actions,move,chat,events,ui,net

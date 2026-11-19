@@ -1,0 +1,5 @@
+# Build output and the staged managed/runtime payload; not source.
+build*/
+managed/
+runtime/
+*.user
