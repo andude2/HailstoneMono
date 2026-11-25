@@ -19,12 +19,12 @@
 #include <unordered_map>
 #include <utility>
 
-namespace hailstone_mono::imgui_bridge {
+namespace hs_mono::imgui_bridge {
 namespace {
 
 MonoLibrary* runtime = nullptr;
 
-// Per-session state MQ2Mono keeps per Mono app domain. HailstoneMono runs one
+// Per-session state MQ2Mono keeps per Mono app domain. HSMono runs one
 // managed session at a time, so the maps are cleared when a session starts.
 std::unordered_map<std::string, bool> open_windows;
 std::unordered_map<std::string, bool> checkbox_values;
@@ -414,13 +414,33 @@ void imgui_GetWindowDrawList_AddCircleFilled(float centerX, float centerY, float
 void imgui_GetWindowDrawList_AddRect(float x1, float y1, float x2, float y2,
                                      std::uint32_t color, float rounding, int corners, float thickness)
 {
-    ImGui::GetWindowDrawList()->AddRect(ImVec2(x1, y1), ImVec2(x2, y2), color, rounding, corners, thickness);
+    // ImGui 1.92.8 swapped AddRect's thickness/flags; `corners` is the flags.
+    ImGui::GetWindowDrawList()->AddRect(ImVec2(x1, y1), ImVec2(x2, y2), color, rounding, thickness, corners);
 }
+
+// The coverage-mask gradient text state (below): between Begin and End the
+// AddRectFilledMultiColor that carries the gradient is not drawn; its left
+// and right colours tint the mask text's vertices instead.
+struct CoverageMask {
+    bool active = false;
+    bool drawing = false;
+    bool have_gradient = false;
+    float x1 = 0, x2 = 0;
+    int vtx_start = 0;
+    std::uint32_t left = 0xffffffff, right = 0xffffffff;
+};
+CoverageMask coverage_mask;
 
 void imgui_GetWindowDrawList_AddRectFilledMultiColor(float x1, float y1, float x2, float y2,
                                                      std::uint32_t topLeft, std::uint32_t topRight,
                                                      std::uint32_t bottomRight, std::uint32_t bottomLeft)
 {
+    if (coverage_mask.drawing) {
+        coverage_mask.left = topLeft;
+        coverage_mask.right = topRight;
+        coverage_mask.have_gradient = true;
+        return;
+    }
     ImGui::GetWindowDrawList()->AddRectFilledMultiColor(ImVec2(x1, y1), ImVec2(x2, y2), topLeft, topRight,
                                                        bottomRight, bottomLeft);
 }
@@ -436,10 +456,54 @@ void imgui_GetWindowDrawList_AddText(float x, float y, std::uint32_t color, Mono
     ImGui::GetWindowDrawList()->AddText(ImVec2(x, y), color, mono_text(text).c_str());
 }
 
-// The coverage-mask layer is MQ's mq/imgui/AlphaMask.h, which Hailstone does
-// not have. Leaving these unregistered is deliberate: UiTheme catches the
-// missing call once and falls back to solid colour text, which is the same
-// fallback an unpatched MQ2Mono takes.
+// Coverage-mask gradient text (MQ's mq/imgui/AlphaMask.h) is framebuffer
+// alpha state, which Hailstone's Vulkan UI renderer has no equivalent of, so
+// it is emulated on the draw list's vertices: Create pushes the region's clip
+// and notes where the mask text's vertices start; the gradient rect between
+// Begin and End is swallowed (AddRectFilledMultiColor above) and End tints
+// each mask vertex by its x across the region, the font texture still
+// supplying per-glyph coverage. Not registering these at all would leave
+// Mono printing "cannot resolve internal call / libraries out of sync" on
+// every load, though UiTheme would then fall back to solid text.
+std::uint32_t coverage_lerp(std::uint32_t a, std::uint32_t b, float t)
+{
+    const auto channel = [t](std::uint32_t x, std::uint32_t y, int shift) {
+        const float from = static_cast<float>((x >> shift) & 0xff);
+        const float to = static_cast<float>((y >> shift) & 0xff);
+        return static_cast<std::uint32_t>(from + (to - from) * t + 0.5f) << shift;
+    };
+    return channel(a, b, 0) | channel(a, b, 8) | channel(a, b, 16) | channel(a, b, 24);
+}
+
+void imgui_GetWindowDrawList_CreateCoverageMaskLayer(float x1, float y1, float x2, float y2)
+{
+    ImDrawList* list = ImGui::GetWindowDrawList();
+    list->PushClipRect(ImVec2(x1, y1), ImVec2(x2, y2), true);
+    coverage_mask = CoverageMask{true, false, false, x1, x2, list->VtxBuffer.Size, 0xffffffff, 0xffffffff};
+}
+
+void imgui_GetWindowDrawList_BeginCoverageMaskedDraw()
+{
+    if (coverage_mask.active) coverage_mask.drawing = true;
+}
+
+void imgui_GetWindowDrawList_EndCoverageMaskedDraw()
+{
+    ImDrawList* list = ImGui::GetWindowDrawList();
+    if (coverage_mask.active) {
+        if (coverage_mask.have_gradient) {
+            const float span = std::max(1.0f, coverage_mask.x2 - coverage_mask.x1);
+            for (int i = coverage_mask.vtx_start; i < list->VtxBuffer.Size; ++i) {
+                ImDrawVert& vert = list->VtxBuffer[i];
+                const float t = std::clamp((vert.pos.x - coverage_mask.x1) / span, 0.0f, 1.0f);
+                const std::uint32_t gradient = coverage_lerp(coverage_mask.left, coverage_mask.right, t);
+                vert.col = (vert.col & 0xff000000u) | (gradient & 0x00ffffffu);
+            }
+        }
+        list->PopClipRect();
+    }
+    coverage_mask = CoverageMask{};
+}
 
 // Spell icons live in the client's A_SpellIcons sheets. The plugin SDK has no
 // texture accessor yet, so an icon cell cannot be drawn here; a no-op keeps
@@ -464,7 +528,11 @@ void imgui_TextFilter_Create(MonoString* id, MonoString* defaultFilter)
 bool imgui_TextFilter_Draw(MonoString* id, MonoString* label, float width)
 {
     const auto it = text_filters.find(mono_text(id));
-    return it != text_filters.end() && it->second->Draw(mono_text(label).c_str(), width);
+    if (it == text_filters.end()) return false;
+    // ImGui 1.93 dropped Draw's width parameter; keep the managed signature
+    // and apply a positive width the way the old Draw did.
+    if (width > 0.0f) ImGui::SetNextItemWidth(width);
+    return it->second->Draw(mono_text(label).c_str());
 }
 
 bool imgui_TextFilter_PassFilter(MonoString* id, MonoString* text)
@@ -638,6 +706,12 @@ void install(MonoLibrary* library)
         &imgui_GetWindowDrawList_AddRectFilledMultiColor);
     add("MonoCore.E3ImGUI::imgui_GetWindowDrawList_AddLine", &imgui_GetWindowDrawList_AddLine);
     add("MonoCore.E3ImGUI::imgui_GetWindowDrawList_AddText", &imgui_GetWindowDrawList_AddText);
+    add("MonoCore.E3ImGUI::imgui_GetWindowDrawList_CreateCoverageMaskLayer",
+        &imgui_GetWindowDrawList_CreateCoverageMaskLayer);
+    add("MonoCore.E3ImGUI::imgui_GetWindowDrawList_BeginCoverageMaskedDraw",
+        &imgui_GetWindowDrawList_BeginCoverageMaskedDraw);
+    add("MonoCore.E3ImGUI::imgui_GetWindowDrawList_EndCoverageMaskedDraw",
+        &imgui_GetWindowDrawList_EndCoverageMaskedDraw);
     add("MonoCore.E3ImGUI::imgui_DrawSpellIconByIconIndex", &imgui_DrawSpellIconByIconIndex);
     add("MonoCore.E3ImGUI::imgui_Image", &imgui_Image);
     add("MonoCore.E3ImGUI::imgui_ImageButton", &imgui_ImageButton);
@@ -662,4 +736,4 @@ void reset_state()
     list_clippers.clear();
 }
 
-} // namespace hailstone_mono::imgui_bridge
+} // namespace hs_mono::imgui_bridge

@@ -134,6 +134,7 @@ namespace Sentinel
             public int[] AvailableDiscs() { return new int[0]; }
             public List<Native.CapabilityRecord> CapabilityInfo() { return null; }
             public string[] SpellEffects(string spell) { return new string[0]; }
+            public bool? CommandExists(string command) { return null; }
         }
     }
 }

@@ -21,7 +21,7 @@ HAILSTONE_PLUGIN
 
 namespace {
 
-using hailstone_mono::MonoLibrary;
+using hs_mono::MonoLibrary;
 
 constexpr char smoke_command_name[] = "/hmonosmoke";
 constexpr char mono_command_name[] = "/mono";
@@ -156,14 +156,36 @@ void sentinel_print(MonoString* value)
 {
     char* text = value ? runtime->string_utf8(value) : nullptr;
     if (!text) return;
-    // Sentinel's MQ color escapes are not Hailstone chat formatting.
-    std::string clean;
-    for (const char* p = text; *p; ++p) {
-        if (*p == '\a' && p[1]) ++p;
-        else clean += *p;
-    }
-    WriteChatf("%s", clean.c_str());
+    // Hailstone renders MacroQuest colour codes (\ag, \ay, \a#RRGGBB, \ax ...)
+    // in plugin chat lines and strips them from plain-text logs itself.
+    WriteChatf("%s", text);
     runtime->free_memory(text);
+}
+
+int sentinel_lend_thread(int lend)
+{
+    if (!HAILSTONE_HOST_HAS(host, lend_thread) || !host->lend_thread) return 0;
+    return host->lend_thread(host->host, lend);
+}
+
+int sentinel_command_exists(MonoString* value)
+{
+    if (!HAILSTONE_HOST_HAS(host, command_exists) || !host->command_exists) return -1;
+    char* text = value ? runtime->string_utf8(value) : nullptr;
+    if (!text) return HAILSTONE_COMMAND_NONE;
+    const int result = host->command_exists(host->host, text);
+    runtime->free_memory(text);
+    return result;
+}
+
+MonoString* sentinel_scripts_config_directory()
+{
+    if (!HAILSTONE_HOST_HAS(host, get_scripts_config_dir) || !host->get_scripts_config_dir)
+        return runtime->make_string(session, "");
+    std::array<char, 4096> directory{};
+    const int length = host->get_scripts_config_dir(host->host, directory.data(), directory.size());
+    return runtime->make_string(session, length > 0 && static_cast<std::size_t>(length) < directory.size() ?
+                                directory.data() : "");
 }
 
 MonoString* sentinel_config()
@@ -244,34 +266,47 @@ uint32_t sentinel_aa_value(int group)
 }
 
 // The extended-target window needs slot ids, aggro and HP from the bulk read,
-// then the spawn's name/level/con/distance from the spawn accessor. Hailstone
-// has no ${Me.XTarget[...]} TLO, so the managed window asks for this instead of
-// parsing expressions. The reply is one tab-separated line per slot:
+// then the spawn's name/level/con/distance from the spawn accessor. The SDK
+// supplies the slot role and aggro, which the spawn TLO does not expose.
+// The reply is one tab-separated line per slot:
 // index, id, aggroPct, pctHPs, level, conColor, name, distance*10, valid, slot role.
 MonoString* sentinel_xtargets()
 {
-    if (!HAILSTONE_HOST_HAS(host, get_xtarget_data_bulk) || !host->get_xtarget_data_bulk)
-        return runtime->make_string(session, "NULL");
-
-    std::array<unsigned char, HS_BULK_XTARGET_RECORD_SIZE * 64> data{};
-    const auto written = host->get_xtarget_data_bulk(host->host, data.data(),
-                                                     static_cast<int32_t>(data.size()));
-    if (written <= 0) return runtime->make_string(session, "");
-    const auto length = std::min<std::size_t>(static_cast<std::size_t>(written), data.size());
-    const auto count = length / sizeof(HS_Bulk_XTargetData);
+    const bool have_bulk = HAILSTONE_HOST_HAS(host, get_xtarget_data_bulk) && host->get_xtarget_data_bulk;
+    const bool have_slot = HAILSTONE_HOST_HAS(host, get_xtarget) && host->get_xtarget;
+    if (!have_bulk && !have_slot) return runtime->make_string(session, "NULL");
 
     HailstonePlayer player{};
     player.size = sizeof player;
+    const bool have_player_state = host->get_player && host->get_player(host->host, &player);
+    std::array<HS_Bulk_XTargetData, 64> records{};
+    const auto written = have_bulk ? host->get_xtarget_data_bulk(host->host,
+        reinterpret_cast<unsigned char*>(records.data()), static_cast<int32_t>(sizeof records)) : 0;
+    const auto bytes = std::min(written > 0 ? static_cast<std::size_t>(written) : std::size_t{0},
+                                sizeof records);
+    std::size_t count = bytes / sizeof(HS_Bulk_XTargetData);
+    if (have_slot && have_player_state) {
+        const auto total = std::min<std::size_t>(player.xtarget_slots, records.size());
+        // Some hosts provide only the per-slot accessor. Keep the physical
+        // slot indices and use spawn HP for any rows missing bulk metrics.
+        for (; count < total; ++count) {
+            HailstoneXTarget slot{};
+            slot.size = sizeof slot;
+            if (host->get_xtarget(host->host, static_cast<uint32_t>(count), &slot)) {
+                records[count].id = static_cast<int32_t>(slot.spawn_id);
+                records[count].targetType = static_cast<int32_t>(slot.type);
+            }
+        }
+    }
+
     HailstoneSpawn player_spawn{};
     player_spawn.size = sizeof player_spawn;
-    const bool have_player = host->get_player && host->get_player(host->host, &player) &&
-        player.spawn_id != 0 && host->get_spawn &&
+    const bool have_player = have_player_state && player.spawn_id != 0 && host->get_spawn &&
         host->get_spawn(host->host, player.spawn_id, &player_spawn);
 
     std::string result;
     for (std::size_t i = 0; i < count; ++i) {
-        HS_Bulk_XTargetData record{};
-        std::memcpy(&record, data.data() + i * sizeof record, sizeof record);
+        const auto& record = records[i];
         const int index = static_cast<int>(i) + 1;
         int level = 0, con = 0, valid = 0, hp = record.pctHPs;
         int distance_tenths = 0;
@@ -335,11 +370,72 @@ MonoString* sentinel_item_click(int32_t slot, int32_t sub)
     return runtime->make_string(session, "");
 }
 
+// One bulk read for Sentinel's NativeData capture (HailstoneBulkKind in
+// Native/HailstoneNativeSource.cs). The bytes are the SDK's own layouts
+// (sdk/hailstone_plugin.h HS_Bulk*); the managed side translates them into
+// the MQ2Mono wire formats its tested decoders consume. Capture runs on the
+// game thread before the worker is granted, so a single reused scratch
+// buffer is safe. It is sized for a full zone of spawns: the host's spawn
+// writer truncates silently at the buffer limit, and a truncated roster
+// would read as despawns.
+MonoArray* sentinel_bulk(int kind)
+{
+    using BulkFn = int32_t (*)(void*, unsigned char*, int32_t);
+    BulkFn read = nullptr;
+    switch (kind) {
+    case 0: // SelfEffects
+        if (HAILSTONE_HOST_HAS(host, get_buff_data_bulk)) read = host->get_buff_data_bulk;
+        break;
+    case 1: // TargetEffects
+        if (HAILSTONE_HOST_HAS(host, get_target_buff_data_bulk)) read = host->get_target_buff_data_bulk;
+        break;
+    case 2: // PetEffects
+        if (HAILSTONE_HOST_HAS(host, get_pet_buff_data_bulk)) read = host->get_pet_buff_data_bulk;
+        break;
+    case 3: // XTargets
+        if (HAILSTONE_HOST_HAS(host, get_xtarget_data_bulk)) read = host->get_xtarget_data_bulk;
+        break;
+    case 4: // SpawnDeltas and FullSpawns read the same host snapshot; the
+    case 5: // managed adapter derives delta records from it.
+        if (HAILSTONE_HOST_HAS(host, get_spawns_data_bulk)) read = host->get_spawns_data_bulk;
+        break;
+    case 6: // AvailAAs
+        if (HAILSTONE_HOST_HAS(host, get_avail_aa_data_bulk)) read = host->get_avail_aa_data_bulk;
+        break;
+    case 7: // AvailDiscs
+        if (HAILSTONE_HOST_HAS(host, get_avail_disc_data_bulk)) read = host->get_avail_disc_data_bulk;
+        break;
+    default:
+        break;
+    }
+
+    std::size_t length = 0;
+    if (read) {
+        static thread_local std::vector<unsigned char> buffer(4u << 20);
+        const auto written = read(host->host, buffer.data(), static_cast<int32_t>(buffer.size()));
+        if (written > 0) {
+            length = static_cast<std::size_t>(written);
+            if (length > buffer.size()) length = buffer.size();
+            auto* result = runtime->array_new(session, runtime->byte_class(), length);
+            if (result) {
+                std::memcpy(runtime->array_addr(result, static_cast<int>(sizeof(unsigned char)), 0),
+                            buffer.data(), length);
+                return result;
+            }
+            return nullptr;
+        }
+    }
+    return runtime->array_new(session, runtime->byte_class(), 0);
+}
+
 void register_sentinel_calls()
 {
     runtime->add_internal_call("Sentinel.HailstoneHost::Parse", reinterpret_cast<const void*>(&sentinel_parse));
     runtime->add_internal_call("Sentinel.HailstoneHost::Command", reinterpret_cast<const void*>(&sentinel_execute));
     runtime->add_internal_call("Sentinel.HailstoneHost::Print", reinterpret_cast<const void*>(&sentinel_print));
+    runtime->add_internal_call("Sentinel.HailstoneHost::LendThread", reinterpret_cast<const void*>(&sentinel_lend_thread));
+    runtime->add_internal_call("Sentinel.HailstoneHost::CommandExists", reinterpret_cast<const void*>(&sentinel_command_exists));
+    runtime->add_internal_call("Sentinel.HailstoneHost::ScriptsConfigDirectory", reinterpret_cast<const void*>(&sentinel_scripts_config_directory));
     runtime->add_internal_call("Sentinel.HailstoneHost::Bind", reinterpret_cast<const void*>(&bind_sentinel_command));
     runtime->add_internal_call("Sentinel.HailstoneHost::Unbind", reinterpret_cast<const void*>(&clear_sentinel_commands));
     runtime->add_internal_call("Sentinel.HailstoneHost::ConfigDirectory", reinterpret_cast<const void*>(&sentinel_config));
@@ -351,7 +447,8 @@ void register_sentinel_calls()
     runtime->add_internal_call("Sentinel.HailstoneHost::XTargets", reinterpret_cast<const void*>(&sentinel_xtargets));
     runtime->add_internal_call("Sentinel.HailstoneHost::ItemClick", reinterpret_cast<const void*>(&sentinel_item_click));
     runtime->add_internal_call("Sentinel.HailstoneHost::RaidHealMembers", reinterpret_cast<const void*>(&sentinel_raid_heal_members));
-    hailstone_mono::imgui_bridge::install(runtime.get());
+    runtime->add_internal_call("Sentinel.HailstoneHost::Bulk", reinterpret_cast<const void*>(&sentinel_bulk));
+    hs_mono::imgui_bridge::install(runtime.get());
 }
 
 void close_session(const char* reason = nullptr)
@@ -450,7 +547,7 @@ void start_session(bool warrior = false, bool sentinel = false)
         const auto path = assembly.u8string();
         const auto managed = runtime->open_assembly(session, reinterpret_cast<const char*>(path.c_str()));
         const auto image = managed ? runtime->assembly_image(managed) : nullptr;
-        const auto smoke = image ? runtime->find_class(image, (warrior || sentinel) ? "Sentinel" : "HailstoneMono",
+        const auto smoke = image ? runtime->find_class(image, (warrior || sentinel) ? "Sentinel" : "HSMono",
             sentinel ? "HailstoneHost" : warrior ? "HailstoneWarriorTrial" : "Smoke") : nullptr;
         if (smoke) {
             const auto init = runtime->find_method(smoke, "OnInit", 0);
@@ -463,7 +560,7 @@ void start_session(bool warrior = false, bool sentinel = false)
                 sentinel_status = runtime->find_method(smoke, "Status", 0);
                 sentinel_imgui = runtime->find_method(smoke, "OnUpdateImGui", 0);
                 register_sentinel_calls();
-                hailstone_mono::imgui_bridge::reset_state();
+                hs_mono::imgui_bridge::reset_state();
                 if (!sentinel_imgui) log(2, "HSMono: managed assembly has no OnUpdateImGui; running headless");
             }
             started = init && pulse && stop && (!warrior || poll) &&
@@ -926,9 +1023,40 @@ HAILSTONE_API void OnPulse()
     log(1, "HSMono: managed OnPulse received the active character snapshot");
 }
 
+// A pet's tells ("<pet> tells you, 'Attacking <target>'") are the pet reporting to its owner.
+// Sentinel relays the tells it sees to the crew, where every pet's reports are spam, so the
+// player's own pet's tells are not handed to it. The line still shows in this character's own
+// chat; every other tell, and another player's pet's, passes unchanged.
+bool own_pet_tell(const char* text)
+{
+    if (!text || !host) return false;
+    if (!HAILSTONE_HOST_HAS(host, get_player) || !host->get_player) return false;
+    if (!HAILSTONE_HOST_HAS(host, get_spawn) || !host->get_spawn) return false;
+    const std::string_view line = text;
+    constexpr std::string_view marker = " tells you, '";
+    const auto at = line.find(marker);
+    if (at == std::string_view::npos || at == 0) return false;
+    const std::string_view sender = line.substr(0, at);
+    HailstonePlayer player{};
+    player.size = sizeof player;
+    if (!host->get_player(host->host, &player) || player.pet_id == 0) return false;
+    HailstoneSpawn pet{};
+    pet.size = sizeof pet;
+    if (!host->get_spawn(host->host, player.pet_id, &pet)) return false;
+    const std::string_view name = pet.name;
+    if (name.size() != sender.size()) return false;
+    for (std::size_t i = 0; i < name.size(); ++i) {
+        const auto a = std::tolower(static_cast<unsigned char>(name[i]));
+        const auto b = std::tolower(static_cast<unsigned char>(sender[i]));
+        // Zone spawn names use '_' where the chat sender's name has a space.
+        if ((a == '_' ? ' ' : a) != (b == '_' ? ' ' : b)) return false;
+    }
+    return true;
+}
+
 HAILSTONE_API int OnIncomingChat(const char* text, uint32_t)
 {
-    if (sentinel_session && text && !invoke_text(sentinel_chat, text))
+    if (sentinel_session && text && !own_pet_tell(text) && !invoke_text(sentinel_chat, text))
         log(3, "Sentinel chat callback failed");
     return 0;
 }
@@ -943,7 +1071,7 @@ HAILSTONE_API void OnUpdateImGui()
     if (!HAILSTONE_HOST_HAS(host, imgui_context) || !host->imgui_context) return;
     void* context = host->imgui_context(host->host);
     if (!context) return;
-    hailstone_mono::imgui_bridge::set_context(context);
+    hs_mono::imgui_bridge::set_context(context);
 
     auto* previous = runtime->current_domain();
     if (!runtime->set_domain(session, false)) return;

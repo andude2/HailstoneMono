@@ -26,10 +26,17 @@ if(NOT EXISTS "${HAILSTONE_IMGUI_DIR}/imgui.h")
     include(FetchContent)
     FetchContent_Declare(hailstone_imgui_src
         GIT_REPOSITORY https://github.com/ocornut/imgui.git
-        GIT_TAG 97428e8ac99e339ce05eee531cf55b77b29ea709 # v1.91.9
+        GIT_TAG c1aaac65e896a45f81f47a4d68f9959e0f86c859 # v1.93.0
         SYSTEM)
     FetchContent_MakeAvailable(hailstone_imgui_src)
     set(HAILSTONE_IMGUI_DIR "${hailstone_imgui_src_SOURCE_DIR}")
+endif()
+
+# Since ABI 4 the client builds Dear ImGui 1.93.0 and shares its context;
+# any other version is a layout mismatch, not a warning.
+file(STRINGS "${HAILSTONE_IMGUI_DIR}/imgui.h" hsmono_imgui_version REGEX "^#define IMGUI_VERSION ")
+if(NOT hsmono_imgui_version MATCHES "\"1.93.0\"")
+    message(FATAL_ERROR "HSMono needs Dear ImGui 1.93.0 exactly (the client's version); ${HAILSTONE_IMGUI_DIR}/imgui.h has: ${hsmono_imgui_version}")
 endif()
 
 add_library(hailstone_imgui STATIC

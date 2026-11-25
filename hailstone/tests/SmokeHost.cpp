@@ -44,7 +44,7 @@ void check(bool condition, const char* what)
 
 } // namespace
 
-namespace hailstone_mono {
+namespace hs_mono {
 
 MonoLibrary::~MonoLibrary() = default;
 
@@ -95,7 +95,7 @@ void set_context(void*) {}
 void reset_state() {}
 } // namespace imgui_bridge
 
-} // namespace hailstone_mono
+} // namespace hs_mono
 
 int main(int argc, char** argv)
 {

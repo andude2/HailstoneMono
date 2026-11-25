@@ -7,7 +7,7 @@
 #include <bit>
 #include <type_traits>
 
-namespace hailstone_mono {
+namespace hs_mono {
 
 MonoLibrary::~MonoLibrary()
 {
@@ -41,7 +41,10 @@ bool MonoLibrary::open(const std::filesystem::path& path)
         bind(unbox, "mono_object_unbox") &&
         bind(string_utf8, "mono_string_to_utf8") &&
         bind(free_memory, "mono_free") &&
-        bind(add_internal_call, "mono_add_internal_call");
+        bind(add_internal_call, "mono_add_internal_call") &&
+        bind(byte_class, "mono_get_byte_class") &&
+        bind(array_new, "mono_array_new") &&
+        bind(array_addr, "mono_array_addr_with_size");
 }
 
 bool MonoLibrary::pin() const
@@ -52,4 +55,4 @@ bool MonoLibrary::pin() const
         static_cast<const wchar_t*>(module_), &pinned) != 0;
 }
 
-} // namespace hailstone_mono
+} // namespace hs_mono

@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 
 namespace MonoCore
 {
-    // A tiny managed caller for the HailstoneMono ImGui bridge. It draws a
+    // A tiny managed caller for the HSMono ImGui bridge. It draws a
     // window that exercises the stateful wrappers (open flags, edit buffers,
     // checkbox, slider, text filter, list clipper, tables, draw list) so the
     // native harness can prove the internal calls are registered and survive

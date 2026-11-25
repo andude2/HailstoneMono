@@ -2,11 +2,15 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using MonoCore;
+using static MonoCore.E3ImGUI;
 
 namespace Sentinel
 {
@@ -22,16 +26,30 @@ namespace Sentinel
         {
             internal Func<string> Fetch;
             internal string Value;
+            internal ExceptionDispatchInfo Error;
             internal readonly ManualResetEventSlim Done = new ManualResetEventSlim();
         }
 
         private readonly ConcurrentQueue<Read> _reads = new ConcurrentQueue<Read>();
         private readonly AutoResetEvent _readReady = new AutoResetEvent(false);
         private readonly int _clientThread = Thread.CurrentThread.ManagedThreadId;
+        private volatile bool _threadLent;
+        // Capture once on the client thread before granting the worker. Reads
+        // outside this list (including readiness) keep their normal live path.
+        private static readonly string[] WorkerStateFields =
+        {
+            "${Me.ID}", "${Me.Dead}", "${Me.Hovering}", "${Me.Stunned}", "${Me.Silenced}",
+            "${Me.PctHPs}", "${Me.PctMana}", "${Me.PctEndurance}",
+            "${Me.Casting.ID}", "${Me.Combat}", "${Me.CombatState}",
+            "${Me.AutoFire}", "${Me.Invis}", "${Me.Pet.ID}", "${Target.ID}",
+            "${Stick.Active}", "${Raid.Members}", "${Raid.MainAssist[1].CleanName}"
+        };
+        private Dictionary<string, string> _workerState;
         private bool _commandsFailed;
         private bool _stopRequested;
         private bool _attack;
         private bool _stick;
+        private bool _afollow;
         private bool _navigation;
         internal static string ConfigurationDirectory = "";
         internal static int BrokerPort = Comms.TcpProtocol.DefaultPort;
@@ -44,6 +62,9 @@ namespace Sentinel
         [MethodImpl(MethodImplOptions.InternalCall)] private static extern string Parse(string text);
         [MethodImpl(MethodImplOptions.InternalCall)] private static extern void Command(string text);
         [MethodImpl(MethodImplOptions.InternalCall)] private static extern void Print(string text);
+        [MethodImpl(MethodImplOptions.InternalCall)] private static extern int LendThread(int lend);
+        [MethodImpl(MethodImplOptions.InternalCall)] private static extern int CommandExists(string name);
+        [MethodImpl(MethodImplOptions.InternalCall)] private static extern string ScriptsConfigDirectory();
         [MethodImpl(MethodImplOptions.InternalCall)] private static extern int Bind(string text);
         [MethodImpl(MethodImplOptions.InternalCall)] private static extern void Unbind();
         [MethodImpl(MethodImplOptions.InternalCall)] internal static extern string ConfigDirectory();
@@ -56,6 +77,7 @@ namespace Sentinel
         [MethodImpl(MethodImplOptions.InternalCall)] private static extern string XTargets();
         [MethodImpl(MethodImplOptions.InternalCall)] private static extern string RaidHealMembers();
         [MethodImpl(MethodImplOptions.InternalCall)] private static extern string ItemClick(int slot, int sub);
+        [MethodImpl(MethodImplOptions.InternalCall)] private static extern byte[] Bulk(int kind);
 
         private static void LoadSettings()
         {
@@ -130,6 +152,15 @@ namespace Sentinel
                 if (File.Exists(destination)) return;
 
                 string root = _importRoot;
+                if (root.Length == 0)
+                {
+                    string scriptsConfig = ScriptsConfigDirectory();
+                    if (!string.IsNullOrEmpty(scriptsConfig))
+                    {
+                        string candidate = Path.Combine(scriptsConfig, "Sentinel");
+                        if (Directory.Exists(candidate)) root = candidate;
+                    }
+                }
                 if (root.Length == 0 && TokenFile.Length != 0)
                 {
                     var directory = new FileInfo(TokenFile).Directory;
@@ -180,6 +211,16 @@ namespace Sentinel
                 WindowPreferences.Load(Path.Combine(ConfigurationDirectory, preferences), previous);
             }
             Comms.CommsChannel.Enabled = false;
+            // Feed NativeData's per-pulse snapshot from the host's bulk
+            // reads. Without this the capture below is a no-op, the
+            // snapshot stays empty, and every spawn/buff/xtarget field
+            // becomes an individual parsed query marshalled from the
+            // worker - hundreds per turn, parked inside the frame.
+            // Capture runs on the client thread, so both providers may
+            // call the native host directly.
+            Native.HailstoneNativeSource.Provider = Bulk;
+            Native.HailstoneNativeSource.QueryProvider = q => Parse(q);
+            _pulsed = false;
             LoadSettings();
             if (!SharesCharacterConfig) ImportCharacterConfig();
             RefreshComms();
@@ -192,7 +233,28 @@ namespace Sentinel
             }
         }
 
-        public static void OnPulse() { RefreshComms(); Core.OnPulse(); }
+        // Hailstone pulses plugins once per rendered frame, and Core.OnPulse
+        // parks that frame until the worker yields: unthrottled, the brain
+        // turn rate equals the frame rate and every frame pays a full turn.
+        // Sentinel's decisions, comms and command delivery are all built
+        // around coarser timers (NativeData itself refreshes spawns every
+        // 50 ms), so grant at most one turn per interval and let the other
+        // frames render. Chat and slash commands only enqueue, so nothing
+        // is lost between turns - worst case they wait one interval.
+        private const int MinPulseIntervalMs = 50;
+        private static int _lastPulseMs;
+        private static bool _pulsed;
+
+        public static void OnPulse()
+        {
+            RefreshComms();
+            int now = Environment.TickCount;
+            // Overflow-safe elapsed check; TickCount wraps every ~49.7 days.
+            if (_pulsed && (int)((uint)now - (uint)_lastPulseMs) < MinPulseIntervalMs) return;
+            _pulsed = true;
+            _lastPulseMs = now;
+            Core.OnPulse();
+        }
 
         // Hailstone calls this from the plugin's OnUpdateImGui export, inside
         // the client's frame. Nothing may leave here: the call enters managed
@@ -216,6 +278,7 @@ namespace Sentinel
                 adapter._readReady.Dispose();
                 if (adapter._attack) Command("/attack off");
                 if (adapter._stick) Command("/stick off");
+                if (adapter._afollow) Command("/afollow off");
                 if (adapter._navigation) Command("/nav stop");
             }
         }
@@ -227,6 +290,21 @@ namespace Sentinel
         {
             var adapter = Core.Host as HailstoneHost;
             if (adapter == null) return boundary.WaitYield(timeout);
+            // When the client supports lend_thread (ABI 4+), lend the client
+            // thread while OnPulse waits so the worker can call host reads
+            // directly without cross-thread queue marshalling. Older clients
+            // return 0 and keep the marshal loop below.
+            int lent = LendThread(1);
+            if (lent != 0)
+            {
+                adapter._threadLent = true;
+                try { return boundary.WaitYield(timeout); }
+                finally
+                {
+                    adapter._threadLent = false;
+                    if (lent == 1) LendThread(0);
+                }
+            }
             var clock = Stopwatch.StartNew();
             var signals = new[] { boundary.YieldSignal, adapter._readReady };
             do
@@ -235,6 +313,7 @@ namespace Sentinel
                 while (adapter._reads.TryDequeue(out read))
                 {
                     try { read.Value = read.Fetch(); }
+                    catch (Exception ex) { read.Error = ExceptionDispatchInfo.Capture(ex); }
                     finally { read.Done.Set(); }
                     if (clock.ElapsedMilliseconds >= timeout) return false;
                 }
@@ -247,11 +326,30 @@ namespace Sentinel
             return false;
         }
 
+        internal bool TryReadWorkerState(string expression, out string value)
+        {
+            // Core has already checked the worker's grant. A detached
+            // continuation sees the new snapshot on the next grant.
+            value = null;
+            return Thread.CurrentThread.ManagedThreadId != _clientThread &&
+                _workerState != null && _workerState.TryGetValue(expression, out value);
+        }
+
         string IGameHost.Query(string expression) { return ReadOnClient(() => QueryClient(expression)); }
+
+        bool? IGameHost.CommandExists(string command)
+        {
+            if (string.IsNullOrWhiteSpace(command)) return false;
+            string result = ReadOnClient(() => CommandExists(command).ToString(CultureInfo.InvariantCulture));
+            int code;
+            if (!int.TryParse(result, NumberStyles.Integer, CultureInfo.InvariantCulture, out code) || code < 0)
+                return null;
+            return code != 0;
+        }
 
         private string ReadOnClient(Func<string> fetch)
         {
-            if (Thread.CurrentThread.ManagedThreadId == _clientThread)
+            if (Thread.CurrentThread.ManagedThreadId == _clientThread || _threadLent)
                 return fetch();
             var read = new Read { Fetch = fetch };
             _reads.Enqueue(read);
@@ -259,6 +357,7 @@ namespace Sentinel
             read.Done.Wait();
             // The client may still be returning from Set; the event is
             // collected with the request instead of being disposed here.
+            if (read.Error != null) read.Error.Throw();
             return read.Value ?? "NULL";
         }
 
@@ -347,9 +446,12 @@ namespace Sentinel
             if (!string.IsNullOrEmpty(value) && value != "NULL") return value;
             string spell;
             if (Indexed(expression, "${Cast.Ready[", "]}", out spell))
-                return Parse("${Me.SpellReady[" + spell + "]}");
-            if (Indexed(expression, "${Me.GemTimer[", "]}", out spell))
-                return Parse("${Me.SpellReady[" + spell + "]}") == "TRUE" ? "0" : "NULL";
+            {
+                long remaining;
+                return Parse("${Me.SpellReady[" + spell + "]}") == "TRUE" &&
+                    long.TryParse(Parse("${Me.GemTimer[" + spell + "]}"), out remaining) && remaining == 0
+                    ? "TRUE" : "FALSE";
+            }
             return value;
         }
 
@@ -377,8 +479,12 @@ namespace Sentinel
                 return sub >= 0 ? "/useitem " + slot + " " + sub : "/useitem " + slot;
             }
             if (Indexed(text, "/itemnotify ", " rightmouseup", out name))
+            {
+                if (string.Equals(name, "chest", StringComparison.OrdinalIgnoreCase))
+                    name = "17"; // RoF2's chest possessions slot
                 return int.TryParse(name, NumberStyles.None, CultureInfo.InvariantCulture, out slot) &&
                     slot >= 0 && slot <= 32 ? "/useitem " + slot : null;
+            }
             string[] words = text.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
             if (words.Length > 1 && words[0].Equals("/stick", StringComparison.OrdinalIgnoreCase))
             {
@@ -404,30 +510,49 @@ namespace Sentinel
             return text;
         }
 
+        private readonly HashSet<string> _reportedCommandFailures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        private void ReportCommandFailure(string text)
+        {
+            if (_reportedCommandFailures.Count < 128 && _reportedCommandFailures.Add(text))
+                Print("[Sentinel/HSMono] Hailstone could not execute " + text);
+        }
+
         void IGameHost.Execute(string text)
         {
-            const string aa = "/alt activate ";
-            if (text.StartsWith(aa, StringComparison.OrdinalIgnoreCase))
+            const string aa = "/alt activate ", aaShort = "/alt act ", disc = "/disc ";
+            if (text.StartsWith(aa, StringComparison.OrdinalIgnoreCase) ||
+                text.StartsWith(aaShort, StringComparison.OrdinalIgnoreCase))
             {
+                int offset = text.StartsWith(aa, StringComparison.OrdinalIgnoreCase) ? aa.Length : aaShort.Length;
                 int id;
-                if (int.TryParse(text.Substring(aa.Length), NumberStyles.None, CultureInfo.InvariantCulture, out id) && id > 0)
-                    UseAbility(2, id.ToString(CultureInfo.InvariantCulture));
+                if (!int.TryParse(text.Substring(offset), NumberStyles.None, CultureInfo.InvariantCulture, out id)
+                    || id <= 0 || UseAbility(2, id.ToString(CultureInfo.InvariantCulture)) == 0)
+                    ReportCommandFailure(text);
+                return;
+            }
+            if (text.StartsWith(disc, StringComparison.OrdinalIgnoreCase))
+            {
+                if (UseAbility(1, text.Substring(disc.Length)) == 0) ReportCommandFailure(text);
                 return;
             }
             string skill;
             if (Indexed(text, "/doability \"", "\"", out skill))
             {
-                UseAbility(0, skill);
+                bool knownSkill = Parse("${Me.Ability[" + skill + "]}") == "TRUE";
+                if (UseAbility(knownSkill ? 0 : 1, skill) == 0) ReportCommandFailure(text);
                 return;
             }
             var line = ResolveCommand(text, Parse);
-            if (line == null) return;
+            if (line == null) { ReportCommandFailure(text); return; }
             Command(line);
             if (text.Equals("/attack on", StringComparison.OrdinalIgnoreCase))
                 _attack = Parse("${Me.Combat}") == "TRUE";
             else if (text.Equals("/attack off", StringComparison.OrdinalIgnoreCase)) _attack = false;
             else if (text.StartsWith("/stick ", StringComparison.OrdinalIgnoreCase))
                 _stick = Parse("${Stick.Active}") == "TRUE";
+            else if (text.StartsWith("/afollow", StringComparison.OrdinalIgnoreCase))
+                _afollow = Parse("${AdvPath.Following}") == "TRUE";
             else if (text.StartsWith("/nav ", StringComparison.OrdinalIgnoreCase))
                 _navigation = Parse("${Navigation.Active}") == "TRUE";
         }
@@ -469,6 +594,76 @@ namespace Sentinel
             Core.GuardUi("init MiniHUD", MiniHud.OnInit);
             Core.GuardUi("init Stuck", StuckWindow.OnInit);
             Core.GuardUi("init Debug", DebugWindow.OnInit);
+
+            // Hailstone window defaults. The client tracks the HoTT id
+            // internally (GameConnection::target_of_target) but exposes no
+            // TargetOfTarget TLO or plugin accessor for it yet, so the ToT
+            // card can only ever read "Target has no target" here: keep it
+            // hidden until that data is reachable (/senttt still opens
+            // it). The peers window is the
+            // opposite: with no MQSentinel native roster on this host, the
+            // managed window is the only peer view, so show it by default
+            // (/sentpeers still toggles it).
+            Core.GuardUi("default ToT closed", () => TargetsTargetWindow.SetOpen(false));
+            Core.GuardUi("default peers open", () => HeartbeatWindow.SetOpen(true));
+        }
+
+        private const int MiniLogoSize = 38;
+        private bool _miniLogoLoaded;
+        private uint[] _miniLogo;
+
+        private static uint[] ReadMiniLogo(string path)
+        {
+            using (var source = new Bitmap(path))
+            using (var bitmap = new Bitmap(MiniLogoSize, MiniLogoSize))
+            {
+                using (var graphics = Graphics.FromImage(bitmap))
+                {
+                    graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    graphics.DrawImage(source, 0, 0, MiniLogoSize, MiniLogoSize);
+                }
+
+                var pixels = new uint[MiniLogoSize * MiniLogoSize];
+                for (int y = 0; y < MiniLogoSize; ++y)
+                for (int x = 0; x < MiniLogoSize; ++x)
+                {
+                    Color pixel = bitmap.GetPixel(x, y);
+                    pixels[y * MiniLogoSize + x] = (uint)pixel.A << 24
+                        | (uint)pixel.B << 16 | (uint)pixel.G << 8 | pixel.R;
+                }
+                return pixels;
+            }
+        }
+
+        private bool? DrawMiniLogo()
+        {
+            if (!_miniLogoLoaded)
+            {
+                _miniLogoLoaded = true;
+                string directory = Path.GetDirectoryName(typeof(HailstoneHost).Assembly.Location);
+                string path = Path.Combine(directory, "resources", "sentinel_cat_128.png");
+                if (File.Exists(path))
+                {
+                    try { _miniLogo = ReadMiniLogo(path); }
+                    catch (Exception ex) { Core.QueueWrite("[Sentinel/mini] " + path + ": " + ex.Message); }
+                }
+            }
+            if (_miniLogo == null) return null;
+
+            // HSMono has no file-backed ImGui textures. Draw the cached
+            // button-sized logo with the same draw list as the HUD toggles.
+            bool clicked = imgui_InvisibleButton("SentinelIcon", MiniLogoSize, MiniLogoSize, 0);
+            float left = imgui_GetItemRectMinX();
+            float top = imgui_GetItemRectMinY();
+            for (int y = 0; y < MiniLogoSize; ++y)
+            for (int x = 0; x < MiniLogoSize; ++x)
+            {
+                uint pixel = _miniLogo[y * MiniLogoSize + x];
+                if (pixel >> 24 != 0)
+                    imgui_GetWindowDrawList_AddRectFilled(
+                        left + x, top + y, left + x + 1, top + y + 1, pixel, 0f, 0);
+            }
+            return clicked;
         }
 
         void IGameHost.RenderWindows()
@@ -482,12 +677,20 @@ namespace Sentinel
             Core.GuardUi("ToT", TargetsTargetWindow.OnUpdateImGui);
             Core.GuardUi("Options", OptionsWindow.OnUpdateImGui);
             Core.GuardUi("Picker", AbilityPicker.OnUpdateImGui);
-            Core.GuardUi("MiniHUD", MiniHud.OnUpdateImGui);
+            Core.GuardUi("MiniHUD", () => MiniHud.OnUpdateImGui(DrawMiniLogo));
             Core.GuardUi("Stuck", StuckWindow.OnUpdateImGui);
             Core.GuardUi("Debug", DebugWindow.OnUpdateImGui);
             Core.GuardUi("EncounterAlert", Encounters.EncounterAlertWindow.OnUpdateImGui);
         }
-        void IGameHost.CaptureNativeData() { }
+        void IGameHost.CaptureNativeData()
+        {
+            _workerState = null;
+            Native.NativeData.Capture(Native.HailstoneNativeSource.Instance);
+            var state = new Dictionary<string, string>(WorkerStateFields.Length, StringComparer.Ordinal);
+            foreach (string field in WorkerStateFields)
+                state.Add(field, QueryClient(field) ?? "NULL");
+            _workerState = state;
+        }
         void IGameHost.StageSpawn() { }
         void IGameHost.SetSpawns() { }
         private static int[] ReadAbilityIds(int kind)

@@ -85,7 +85,9 @@ build-hailstone/Release/embedded_warrior_test.exe <config-dir>
 `<config-dir>` is the prepared `plugins/HSMono` layout (a `runtime/`
 and `managed/sentinel.dll`). The embedded test fails if the UI pass draws no
 vertices, so a broken internal call or an unbalanced ImGui scope is caught
-before the game.
+before the game. It checks that Sentinel reads the XTarget slot count from the bulk records
+and that `/sentclear` can choose a hater with no selected target when the
+bridge reads through the SDK's per-slot accessor.
 
 ## Sentinel warrior dry run
 
@@ -98,7 +100,12 @@ Developer PowerShell for Visual Studio:
 ```
 
 Place the resulting `sentinel.dll` in `plugins/HSMono/managed/` and
-reload the updated native plugin. On a living warrior, select a living NPC
+reload the updated native plugin. For the mini HUD logo, copy
+`resources/sentinel_cat_128.png` from the Sentinel Lua folder into
+`plugins/HSMono/managed/resources/`. Sentinel reads the PNG once per managed
+session and uses the **S** button when the file is missing or cannot be decoded.
+
+On a living warrior, select a living NPC
 within 200 units, then run `/hmonosmoke warrior`. Check the log for proposed
 targeting and combat actions. Select another NPC and run the same command
 to capture a new target. Run `/hmonosmoke disengage` to see the proposed
@@ -158,6 +165,12 @@ managed windows draw on Hailstone's ImGui context instead of MQ2Mono's.
 The host stops the managed domain during zoning and starts it in the next
 zone. Use one Sentinel implementation per client.
 
+The bridge captures common player, target, and raid queries once per gameplay
+pulse. The worker reads those values without waiting for a client-thread
+handoff for each expression. Command guards and readiness checks use live
+queries. The client still waits for the worker to yield, so an unusually
+long turn can still delay the frame.
+
 ### UI status
 
 The windows themselves (Options, Heartbeat, XTarget, Songs, ToT, AA Peers,
@@ -180,11 +193,18 @@ borderless mode, XTarget empty-slot visibility, and the Stuck panel's peer
 filter save immediately to `sentinel-ui.json` in Hailstone's character plugin
 configuration directory.
 
+Sentinel's skill, discipline and activated AA commands use the host's ability
+API. Its spell checks read the host's gem timer, including linked reuse, and
+its aura checks read the server's active aura names. Bard song staging follows
+the character's casting state. Command translation and host activation
+failures are reported once per command in each Sentinel session.
+
 The extended-target window reads Hailstone's `get_xtarget_data_bulk` for
 slot role, ID, aggro and HP, and uses `get_spawn` for name, level, con and
 distance. `/sentclear` uses those bulk slot roles and IDs to count and select
-auto haters. The XTarget window falls back to TLOs when the bulk accessor
-is absent.
+auto haters. When the bulk reply omits slots, the bridge reads those slots
+through `get_xtarget`. The Hailstone snapshot gets its slot count from the bulk
+reply. The MacroQuest snapshot uses `Me.XTargetSlots` to check its native read.
 
 Chase resolves the leader to an in-zone spawn and uses Hailstone's
 `/nav id` command. `/sentchase status` reports the last movement check,
@@ -213,13 +233,23 @@ older assembly without it runs headless and says so in the log.
 
 ## Crew and casting
 
-The C# host connects to the existing loopback Sentinel broker using
+The C# host connects to the loopback Sentinel broker using
 `port`, `token_file`, and `server` from `HSMono/sentinel.json`.
 If that file supplies no `token_file`, it reads the existing `MQSentinel/sentinel.json`
 beside the HSMono directory. Set the same server label as the rest of
-the crew and keep the existing broker running. `/sentinel status` reports
-connection status. `/engage <id>` and `/sentclear` broadcast through the
-broker. The `local` forms stay on the current client.
+the crew. `/sentinel status` reports connection status. `/engage <id>` and
+`/sentclear` broadcast through the broker. The `local` forms stay on the
+current client.
+
+When nothing is listening on the port, the C# host starts the broker from
+the `sentinel-broker.path` manifest and `broker/<hash>/sentinel-broker.exe`
+deployed beside the managed `sentinel.dll`, with `--port <port>`. That is the
+same content-addressed deployment MacroQuest Sentinel uses, and the broker
+outlives the client, so the first client to zone in brings it up for the
+whole crew. If the manifest or executable is missing, the attempt is
+reported with `/sentinel status` and the connection retries as before; start
+the broker by hand in that case. ACNet depends on the same listener and
+does not start one itself.
 
 Set `config_root` in `HSMono/sentinel.json` to share an existing
 Sentinel configuration tree with MacroQuest. Point it at the

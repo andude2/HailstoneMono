@@ -3,10 +3,12 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <map>
 #include <vector>
@@ -31,19 +33,27 @@ std::vector<std::string> chat;
 bool production = false;
 bool broker_probe = false;
 const auto client_thread = std::this_thread::get_id();
+std::atomic<bool> thread_lent{false};
+std::atomic<int> lend_calls{0};
 void require_client_thread()
 {
-    if (std::this_thread::get_id() != client_thread) std::abort();
+    if (std::this_thread::get_id() == client_thread || thread_lent.load()) return;
+    std::abort();
 }
 enum class Party { solo, group, raid };
 Party party = Party::solo;
 uint32_t zone = 10;
 uint32_t target = 42;
+bool selected_target = true;
 uint64_t incarnation = 1;
 bool attacking = false;
 int attack_ons = 0;
 int attack_offs = 0;
 int xtarget_bulk_calls = 0;
+int xtarget_slot_calls = 0;
+bool xtarget_bulk_available = true;
+int hovering_reads = 0;
+int mana_reads = 0;
 
 int copy(std::string_view text, char* out, std::size_t capacity)
 {
@@ -97,7 +107,7 @@ int main(int argc, char** argv)
     host.get_xtarget_data_bulk = [](void*, unsigned char* out, int32_t capacity) -> int32_t {
         require_client_thread();
         ++xtarget_bulk_calls;
-        if (capacity < static_cast<int32_t>(sizeof(HS_Bulk_XTargetData))) return 0;
+        if (!xtarget_bulk_available || capacity < static_cast<int32_t>(sizeof(HS_Bulk_XTargetData))) return 0;
         HS_Bulk_XTargetData record{};
         record.targetType = HS_BULK_XTARGET_AUTO_HATER;
         record.id = static_cast<int32_t>(target);
@@ -106,7 +116,35 @@ int main(int argc, char** argv)
         std::memcpy(out, &record, sizeof record);
         return sizeof record;
     };
+    host.get_xtarget = [](void*, uint32_t index, HailstoneXTarget* slot) {
+        require_client_thread();
+        ++xtarget_slot_calls;
+        if (index != 0) return 0;
+        slot->spawn_id = target;
+        slot->type = HS_BULK_XTARGET_AUTO_HATER;
+        return 1;
+    };
     host.config_dir = [](void*, char* out, std::size_t size) { return copy(config, out, size); };
+    host.lend_thread = [](void*, int lend) -> int {
+        if (std::this_thread::get_id() != client_thread) return 0;
+        if (lend) {
+            if (thread_lent.exchange(true)) return 2;
+            ++lend_calls;
+            return 1;
+        }
+        thread_lent.store(false);
+        return 1;
+    };
+    host.command_exists = [](void*, const char* name) -> int {
+        require_client_thread();
+        if (!name || !*name) return HAILSTONE_COMMAND_NONE;
+        std::string key = name;
+        if (key.front() != '/') key.insert(key.begin(), '/');
+        if (bindings.find(key) != bindings.end()) return HAILSTONE_COMMAND_ADDED;
+        if (key == "/afollow" || key == "/exchange" || key == "/unequip") return HAILSTONE_COMMAND_ADDED;
+        return HAILSTONE_COMMAND_NONE;
+    };
+    host.get_scripts_config_dir = [](void*, char* out, std::size_t size) { return copy("", out, size); };
     host.add_command = [](void*, const char* name, HailstoneCommandFn fn, void* user) {
         require_client_thread();
         if (std::string_view(name) == "/hmonosmoke") command = fn;
@@ -122,7 +160,8 @@ int main(int argc, char** argv)
         player->in_zone = 1;
         player->spawn_id = 1;
         player->class_id = 1;
-        player->target_id = target;
+        player->target_id = selected_target ? target : 0;
+        player->xtarget_slots = 1;
         player->zone_id = zone;
         player->in_group = party == Party::group;
         player->in_raid = party == Party::raid;
@@ -156,8 +195,12 @@ int main(int argc, char** argv)
                  query == "${Group.MainTank.CleanName}") value = "NULL";
         else if (query == "${Group.Members}") value = "1";
         else if (query == "${Me.Combat}") value = attacking ? "TRUE" : "FALSE";
+        else if (query == "${Me.Hovering}") { ++hovering_reads; value = "NULL"; }
+        else if (query == "${Me.PctMana}") { ++mana_reads; value = "100"; }
         else if (query == "${Me.PctEndurance}") value = "100";
         else if (query == "${Me.Pet.ID}" || query == "${Me.Casting.ID}") value = "0";
+        else if (query == "${Me.XTargetSlots}") value = "NULL";
+        else if (query == "${Target.ID}" && !selected_target) value = "0";
         else if (query.ends_with(".ID}")) return copy(std::to_string(target), out, size);
         else if (query.ends_with(".Type}")) value = "NPC";
         else if (query.ends_with(".Distance3D}")) value = "8";
@@ -171,10 +214,11 @@ int main(int argc, char** argv)
     io.DisplaySize = ImVec2(640.0f, 480.0f);
     io.DeltaTime = 1.0f / 60.0f;
     io.Fonts->AddFontDefault();
-    unsigned char* pixels = nullptr;
-    int pixelWidth = 0, pixelHeight = 0;
-    io.Fonts->GetTexDataAsRGBA32(&pixels, &pixelWidth, &pixelHeight);
-    io.Fonts->SetTexID(static_cast<ImTextureID>(1));
+    // ImGui 1.93: no renderer backend here, so claim texture support and let
+    // NewFrame build the atlas (the client's tests do the same); nothing
+    // uploads the result. Without this NewFrame logs that the atlas is not
+    // built and the backend does not support RendererHasTextures.
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
     host.imgui_context = [](void*) -> void* { return ImGui::GetCurrentContext(); };
 
     hailstone_plugin_set_host(&host);
@@ -282,6 +326,13 @@ int main(int argc, char** argv)
     run_mono("list");
     const bool running_list = !chat.empty() && chat.back() == "HSMono: Sentinel";
     const bool ui_drawn = draw_ui() > 0;
+    const bool logo_installed = std::filesystem::is_regular_file(
+        std::filesystem::path(config) / "managed/resources/sentinel_cat_128.png");
+    const ImGuiWindow* mini = ImGui::FindWindowByName("Sentinel Mini##SentinelMini");
+    // The supplied full-color logo adds a quad for each visible pixel.
+    const bool logo_drawn = mini && mini->DrawList->VtxBuffer.Size > 1000;
+    const bool logo_ok = logo_drawn == logo_installed;
+    if (!logo_ok) std::puts("Mini HUD logo draw did not match the deployed PNG");
     const auto sentinel = bindings.find("/sentinel");
     if (sentinel == bindings.end()) { ShutdownPlugin(); return 1; }
     // The C# windows are the only implementation in Hailstone, so their
@@ -320,6 +371,9 @@ int main(int argc, char** argv)
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+    bool captured_xtarget = false;
+    for (const auto& line : chat)
+        if (line.find("xtargets=1") != std::string::npos) captured_xtarget = true;
     const auto engage = bindings.find("/engage");
     if (engage == bindings.end()) { ShutdownPlugin(); return 1; }
     engage->second.fn(engage->second.user, "local 43");
@@ -328,6 +382,14 @@ int main(int argc, char** argv)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     const bool engaged = attacking;
+    // With an unsupported Hovering member, the worker repeatedly sees NULL.
+    // Only capture and the client-side lifecycle validation should parse it.
+    hovering_reads = mana_reads = 0;
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    OnPulse();
+    const bool batched_reads = mana_reads == 1 && hovering_reads == 2;
+    if (!batched_reads)
+        std::printf("pulse state reads: mana=%d hovering=%d\n", mana_reads, hovering_reads);
     const auto disengage = bindings.find("/sentdisengage");
     if (disengage == bindings.end()) { ShutdownPlugin(); return 1; }
     disengage->second.fn(disengage->second.user, "");
@@ -338,6 +400,8 @@ int main(int argc, char** argv)
     const bool disengaged = !attacking;
     const auto clear = bindings.find("/sentclear");
     if (clear == bindings.end()) { ShutdownPlugin(); return 1; }
+    selected_target = false;
+    xtarget_bulk_available = false;
     clear->second.fn(clear->second.user, "local");
     bool camp_clear = false;
     for (int i = 0; i < 200 && !camp_clear; ++i) {
@@ -347,6 +411,7 @@ int main(int argc, char** argv)
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+    selected_target = true;
     OnBeginZone();
     const bool zone_unbound = bindings.find("/sentinel") == bindings.end();
     ++zone;
@@ -364,10 +429,10 @@ int main(int argc, char** argv)
     ShutdownPlugin();
     const bool commands_removed = bindings.find("/mono") == bindings.end() && command == nullptr;
     ImGui::DestroyContext();
-    std::printf("xtarget bulk calls=%d\n", xtarget_bulk_calls);
+    std::printf("xtarget bulk calls=%d lend_thread calls=%d\n", xtarget_bulk_calls, lend_calls.load());
     if (!ui_drawn) std::puts("UI pass drew no vertices");
-    return status && engaged && disengaged && camp_clear && zone_unbound && zone_rebound && cleared && ui_drawn
-        && window_commands && peer_window && xtarget_bulk_calls > 0
-        && empty_list && version && unknown_app && running_list && alias_loaded && cancelled_resume
+    return status && engaged && disengaged && camp_clear && zone_unbound && zone_rebound && cleared && ui_drawn && logo_ok
+        && batched_reads && window_commands && peer_window && captured_xtarget && xtarget_bulk_calls > 0
+        && xtarget_slot_calls > 0 && lend_calls.load() > 0 && empty_list && version && unknown_app && running_list && alias_loaded && cancelled_resume
         && commands_removed ? 0 : 1;
 }

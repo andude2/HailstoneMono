@@ -2,11 +2,12 @@
 
 #include <mono/jit/jit.h>
 #include <mono/metadata/assembly.h>
+#include <mono/metadata/object.h>
 #include <mono/utils/mono-publib.h>
 
 #include <filesystem>
 
-namespace hailstone_mono {
+namespace hs_mono {
 
 class MonoLibrary {
 public:
@@ -38,8 +39,12 @@ public:
 
     decltype(&mono_add_internal_call) add_internal_call = nullptr;
 
+    decltype(&mono_get_byte_class) byte_class = nullptr;
+    decltype(&mono_array_new) array_new = nullptr;
+    decltype(&mono_array_addr_with_size) array_addr = nullptr;
+
 private:
     void* module_ = nullptr;
 };
 
-} // namespace hailstone_mono
+} // namespace hs_mono

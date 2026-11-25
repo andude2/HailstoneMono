@@ -1,6 +1,6 @@
 using System;
 
-namespace HailstoneMono
+namespace HSMono
 {
     public static class Smoke
     {

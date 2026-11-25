@@ -12,7 +12,7 @@
 
 namespace {
 
-using hailstone_mono::MonoLibrary;
+using hs_mono::MonoLibrary;
 
 bool failed(const char* what)
 {
@@ -35,11 +35,12 @@ int main(int argc, char** argv)
     io.DisplaySize = ImVec2(640.0f, 480.0f);
     io.DeltaTime = 1.0f / 60.0f;
     io.Fonts->AddFontDefault();
-    unsigned char* pixels = nullptr;
-    int width = 0, height = 0;
-    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
-    io.Fonts->SetTexID(static_cast<ImTextureID>(1));
-    hailstone_mono::imgui_bridge::set_context(ImGui::GetCurrentContext());
+    // ImGui 1.93: no renderer backend here, so claim texture support and let
+    // NewFrame build the atlas (the client's tests do the same); nothing
+    // uploads the result. Without this NewFrame logs that the atlas is not
+    // built and the backend does not support RendererHasTextures.
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+    hs_mono::imgui_bridge::set_context(ImGui::GetCurrentContext());
     ImGui::NewFrame();
 
     const std::filesystem::path runtime_dir(argv[1]);
@@ -62,7 +63,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    hailstone_mono::imgui_bridge::install(&library);
+    hs_mono::imgui_bridge::install(&library);
     auto* assembly = library.open_assembly(root, argv[2]);
     auto* image = assembly ? library.assembly_image(assembly) : nullptr;
     auto* type = image ? library.find_class(image, "MonoCore", "E3ImGUI") : nullptr;

@@ -1,6 +1,6 @@
 #pragma once
 
-namespace hailstone_mono {
+namespace hs_mono {
 
 class MonoLibrary;
 
@@ -23,4 +23,4 @@ void set_context(void* context);
 void reset_state();
 
 } // namespace imgui_bridge
-} // namespace hailstone_mono
+} // namespace hs_mono
